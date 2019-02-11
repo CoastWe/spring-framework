@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2016 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,47 +18,122 @@ package org.springframework.mock.http.server.reactive.test;
 
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.Optional;
+import java.util.function.Function;
 
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
-import org.springframework.http.MediaType;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.server.reactive.AbstractServerHttpResponse;
-import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.util.Assert;
+import org.springframework.util.MimeType;
 
 /**
- * Mock implementation of {@link ServerHttpResponse}.
+ * Mock extension of {@link AbstractServerHttpResponse} for use in tests without
+ * an actual server.
+ *
+ * <p>By default response content is consumed in full upon writing and cached
+ * for subsequent access, however it is also possible to set a custom
+ * {@link #setWriteHandler(Function) writeHandler}.
+ *
  * @author Rossen Stoyanchev
  * @since 5.0
  */
 public class MockServerHttpResponse extends AbstractServerHttpResponse {
 
-	private Flux<DataBuffer> body;
+	private Flux<DataBuffer> body = Flux.error(new IllegalStateException(
+			"No content was written nor was setComplete() called on this response."));
+
+	private Function<Flux<DataBuffer>, Mono<Void>> writeHandler;
 
 
 	public MockServerHttpResponse() {
-		super(new DefaultDataBufferFactory());
+		this(new DefaultDataBufferFactory());
+	}
+
+	public MockServerHttpResponse(DataBufferFactory dataBufferFactory) {
+		super(dataBufferFactory);
+		this.writeHandler = body -> {
+			this.body = body.cache();
+			return this.body.then();
+		};
 	}
 
 
 	/**
-	 * Return the output Publisher used to write to the response.
+	 * Configure a custom handler to consume the response body.
+	 * <p>By default, response body content is consumed in full and cached for
+	 * subsequent access in tests. Use this option to take control over how the
+	 * response body is consumed.
+	 * @param writeHandler the write handler to use returning {@code Mono<Void>}
+	 * when the body has been "written" (i.e. consumed).
+	 */
+	public void setWriteHandler(Function<Flux<DataBuffer>, Mono<Void>> writeHandler) {
+		Assert.notNull(writeHandler, "'writeHandler' is required");
+		this.body = Flux.error(new IllegalStateException("Not available with custom write handler."));
+		this.writeHandler = writeHandler;
+	}
+
+	@Override
+	public <T> T getNativeResponse() {
+		throw new IllegalStateException("This is a mock. No running server, no native response.");
+	}
+
+
+	@Override
+	protected void applyStatusCode() {
+	}
+
+	@Override
+	protected void applyHeaders() {
+	}
+
+	@Override
+	protected void applyCookies() {
+		getCookies().values().stream().flatMap(Collection::stream)
+				.forEach(cookie -> getHeaders().add(HttpHeaders.SET_COOKIE, cookie.toString()));
+	}
+
+	@Override
+	protected Mono<Void> writeWithInternal(Publisher<? extends DataBuffer> body) {
+		return this.writeHandler.apply(Flux.from(body));
+	}
+
+	@Override
+	protected Mono<Void> writeAndFlushWithInternal(
+			Publisher<? extends Publisher<? extends DataBuffer>> body) {
+
+		return this.writeHandler.apply(Flux.from(body).concatMap(Flux::from));
+	}
+
+	@Override
+	public Mono<Void> setComplete() {
+		return doCommit(() -> Mono.defer(() -> this.writeHandler.apply(Flux.empty())));
+	}
+
+	/**
+	 * Return the response body or an error stream if the body was not set.
 	 */
 	public Flux<DataBuffer> getBody() {
 		return this.body;
 	}
 
 	/**
-	 * Return the response body aggregated and converted to a String using the
-	 * charset of the Content-Type response or otherwise as "UTF-8".
+	 * Aggregate response data and convert to a String using the "Content-Type"
+	 * charset or "UTF-8" by default.
 	 */
 	public Mono<String> getBodyAsString() {
-		Charset charset = getCharset();
+
+		Charset charset = Optional.ofNullable(getHeaders().getContentType()).map(MimeType::getCharset)
+				.orElse(StandardCharsets.UTF_8);
+
 		return getBody()
 				.reduce(bufferFactory().allocateBuffer(), (previous, current) -> {
 					previous.write(current);
@@ -73,38 +148,6 @@ public class MockServerHttpResponse extends AbstractServerHttpResponse {
 		byte[] bytes = new byte[buffer.readableByteCount()];
 		buffer.read(bytes);
 		return new String(bytes, charset);
-	}
-
-	private Charset getCharset() {
-		Charset charset = null;
-		MediaType contentType = getHeaders().getContentType();
-		if (contentType != null) {
-			charset = contentType.getCharset();
-		}
-		return (charset != null ? charset : StandardCharsets.UTF_8);
-	}
-
-	@Override
-	protected Mono<Void> writeWithInternal(Publisher<? extends DataBuffer> body) {
-		this.body = Flux.from(body);
-		return Mono.empty();
-	}
-
-	@Override
-	protected Mono<Void> writeAndFlushWithInternal(Publisher<? extends Publisher<? extends DataBuffer>> body) {
-		return writeWithInternal(Flux.from(body).flatMap(Flux::from));
-	}
-
-	@Override
-	protected void applyStatusCode() {
-	}
-
-	@Override
-	protected void applyHeaders() {
-	}
-
-	@Override
-	protected void applyCookies() {
 	}
 
 }
